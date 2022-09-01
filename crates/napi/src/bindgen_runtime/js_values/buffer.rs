@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -22,7 +22,8 @@ thread_local! {
 /// So it is safe to use it in `async fn`, the `&[u8]` under the hood will not be dropped until the `drop` called.
 /// Clone will create a new `Reference` to the same underlying `JavaScript Buffer`.
 pub struct Buffer {
-  pub(crate) inner: &'static mut [u8],
+  pub(crate) inner: NonNull<u8>,
+  pub(crate) len: usize,
   pub(crate) capacity: usize,
   raw: Option<(sys::napi_ref, sys::napi_env)>,
   // use it as ref count
@@ -31,15 +32,15 @@ pub struct Buffer {
 
 impl Drop for Buffer {
   fn drop(&mut self) {
+    if let Some((ref_, env)) = self.raw {
+      check_status_or_throw!(
+        env,
+        unsafe { sys::napi_reference_unref(env, ref_, &mut 0) },
+        "Failed to unref Buffer reference in drop"
+      );
+      return;
+    }
     if Arc::strong_count(&self.drop_in_vm) == 1 {
-      if let Some((ref_, env)) = self.raw {
-        check_status_or_throw!(
-          env,
-          unsafe { sys::napi_reference_unref(env, ref_, &mut 0) },
-          "Failed to unref Buffer reference in drop"
-        );
-        return;
-      }
       // Drop in Rust side
       // ```rust
       // #[napi]
@@ -47,7 +48,7 @@ impl Drop for Buffer {
       //     Buffer::from(vec![1, 2, 3]).len() as u32
       // }
       if !self.drop_in_vm.load(Ordering::Acquire) {
-        unsafe { Vec::from_raw_parts(self.inner.as_mut_ptr(), self.inner.len(), self.capacity) };
+        unsafe { Vec::from_raw_parts(self.inner.as_ptr(), self.len, self.capacity) };
       }
     }
   }
@@ -67,7 +68,8 @@ impl Buffer {
       None
     };
     Ok(Self {
-      inner: unsafe { slice::from_raw_parts_mut(self.inner.as_mut_ptr(), self.inner.len()) },
+      inner: self.inner,
+      len: self.len,
       capacity: self.capacity,
       raw,
       drop_in_vm: self.drop_in_vm.clone(),
@@ -92,7 +94,10 @@ impl From<Vec<u8>> for Buffer {
     let capacity = data.capacity();
     mem::forget(data);
     Buffer {
-      inner: unsafe { slice::from_raw_parts_mut(inner_ptr, len) },
+      // SAFETY: Vec guaranteed that its pointer is never null:
+      // > The pointer will never be null, so this type is null-pointer-optimized.
+      inner: unsafe { NonNull::new_unchecked(inner_ptr) },
+      len,
       capacity,
       raw: None,
       drop_in_vm: Arc::new(AtomicBool::new(false)),
@@ -102,7 +107,7 @@ impl From<Vec<u8>> for Buffer {
 
 impl From<Buffer> for Vec<u8> {
   fn from(buf: Buffer) -> Self {
-    buf.inner.to_vec()
+    buf.as_ref().to_vec()
   }
 }
 
@@ -114,13 +119,13 @@ impl From<&[u8]> for Buffer {
 
 impl AsRef<[u8]> for Buffer {
   fn as_ref(&self) -> &[u8] {
-    self.inner
+    unsafe { slice::from_raw_parts(self.inner.as_ptr(), self.len) }
   }
 }
 
 impl AsMut<[u8]> for Buffer {
   fn as_mut(&mut self) -> &mut [u8] {
-    self.inner
+    unsafe { slice::from_raw_parts_mut(self.inner.as_ptr(), self.len) }
   }
 }
 
@@ -128,13 +133,13 @@ impl Deref for Buffer {
   type Target = [u8];
 
   fn deref(&self) -> &Self::Target {
-    self.inner
+    self.as_ref()
   }
 }
 
 impl DerefMut for Buffer {
   fn deref_mut(&mut self) -> &mut Self::Target {
-    self.inner
+    self.as_mut()
   }
 }
 
@@ -159,11 +164,18 @@ impl FromNapiValue for Buffer {
     )?;
     check_status!(
       unsafe { sys::napi_get_buffer_info(env, napi_val, &mut buf, &mut len as *mut usize) },
-      "Failed to convert napi buffer into rust Vec<u8>"
+      "Failed to get buffer info"
     )?;
 
+    let buf = NonNull::new(buf as *mut u8);
+    let inner = match buf {
+      Some(buf) if len != 0 => buf,
+      _ => NonNull::dangling(),
+    };
+
     Ok(Self {
-      inner: unsafe { slice::from_raw_parts_mut(buf as *mut _, len) },
+      inner,
+      len,
       capacity: len,
       raw: Some((ref_, env)),
       drop_in_vm: Arc::new(AtomicBool::new(true)),
@@ -182,7 +194,7 @@ impl ToNapiValue for Buffer {
       )?;
       return Ok(buf);
     }
-    let len = val.inner.len();
+    let len = val.len;
     val.drop_in_vm.store(true, Ordering::Release);
     let mut ret = ptr::null_mut();
     check_status!(
@@ -192,12 +204,12 @@ impl ToNapiValue for Buffer {
         // the same data pointer if it's 0x0.
         unsafe { sys::napi_create_buffer(env, len, ptr::null_mut(), &mut ret) }
       } else {
-        let val_ptr = val.inner.as_mut_ptr();
+        let val_ptr = val.inner;
         unsafe {
           sys::napi_create_external_buffer(
             env,
             len,
-            val_ptr as *mut c_void,
+            val_ptr.as_ptr() as *mut c_void,
             Some(drop_buffer),
             Box::into_raw(Box::new(val)) as *mut c_void,
             &mut ret,
@@ -222,12 +234,7 @@ impl ToNapiValue for &mut Buffer {
       )?;
       Ok(buf)
     } else {
-      let buf = Buffer {
-        inner: unsafe { slice::from_raw_parts_mut(val.inner.as_mut_ptr(), val.capacity) },
-        capacity: val.capacity,
-        raw: None,
-        drop_in_vm: Arc::new(AtomicBool::new(true)),
-      };
+      let buf = val.clone(&Env::from(env));
       unsafe { ToNapiValue::to_napi_value(env, buf) }
     }
   }
